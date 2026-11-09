@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}정답지 검증 | 보도자료 → 기사{% endblock %}
+{% block content %}
+<main class="upload wide-main">
+  <div class="intro">
+    <h1>정답지로 에이전트 검증</h1>
+    <p>여러 파일을 한 번에 돌려서 정답지와 같은 답이 나왔는지 표로 채점해요.</p>
+  </div>
+
+  {% if error %}<div class="alert">⚠ {{ error }}</div>{% endif %}
+  <div class="agents">
+    <span class="{{ 'ok' if ready else 'no' }}">{{ '●' if ready else '○' }} 기사 작성 에이전트 {{ '연결됨' if ready else '미설정' }}</span>
+    <span class="{{ 'ok' if ready2 else 'no' }}">{{ '●' if ready2 else '○' }} 인터랙티브 기사 에이전트 {{ '연결됨' if ready2 else '미설정 (UPSTAGE_AGENT2_ID)' }}</span>
+  </div>
+
+  <section class="panel pane">
+    <h2 class="sec-h">① 폴더에 넣어둔 파일로 실행</h2>
+    <p class="note"><code>{{ inputs_rel }}</code> 폴더의 파일을 정답지 <code>{{ answers_rel }}</code>와 비교해요. 하위 폴더 <code>기사/</code>에 넣은 파일은 기사로 처리돼요.</p>
+    {% if inputs %}
+      <table class="grid">
+        <thead><tr><th>파일</th><th>입력</th>{% for f in fields %}<th>정답 {{ f.name }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for x in inputs %}
+          <tr><td>{{ x.file }}</td><td>{{ x.kind }}</td>
+            {% for f in fields %}<td>{{ x.row.get(f.name) if x.row and x.row.get(f.name) else '—' }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <form method="post" action="{{ url_for('eval_run') }}">
+        <button class="btn-primary" type="submit">파일 {{ inputs|length }}개 검증 실행</button>
+      </form>
+    {% else %}
+      <p class="note">아직 파일이 없어요. 위 폴더에 보도자료를 넣고 새로고침하세요.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel pane">
+    <h2 class="sec-h">② 파일을 직접 올려서 실행</h2>
+    <form method="post" action="{{ url_for('eval_run') }}" enctype="multipart/form-data" class="stack">
+      <div class="field">
+        <label class="label small" for="files">보도자료·기사 파일 (여러 개 선택 가능)</label>
+        <input type="file" id="files" name="files" multiple accept=".pdf,.hwp,.hwpx,.docx,.pptx,.xlsx,.png,.jpg,.jpeg,.bmp,.tiff,.heic,.txt">
+      </div>
+      <div class="field">
+        <label class="label small" for="answers">정답지 CSV <span class="muted">(비우면 {{ answers_rel }} 사용)</span></label>
+        <input type="file" id="answers" name="answers" accept=".csv">
+      </div>
+      <button class="btn-primary" type="submit">올린 파일로 검증 실행</button>
+    </form>
+  </section>
+
+  <section class="panel pane">
+    <h2 class="sec-h">정답지 쓰는 법</h2>
+    <p class="note">엑셀에서 아래처럼 쓰고 <b>CSV UTF-8</b>(또는 CSV)로 저장하세요. 빈 칸은 채점하지 않고 예측값만 보여줘요. 결과 CSV의 ‘예측’ 열을 복사해 정답지를 만들 때 참고해도 돼요.</p>
+    <table class="grid">
+      <thead><tr><th>파일명</th><th>입력</th>{% for f in fields %}<th>{{ f.name }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        <tr><td>포항시_관광지도.pdf</td><td>보도자료</td><td>행사·일정 안내</td><td>승인</td><td>지도형</td></tr>
+        <tr><td>인사발령.pdf</td><td>보도자료</td><td>인사·동정</td><td>거부</td><td></td></tr>
+        <tr><td>기사_전기료.docx</td><td>기사</td><td></td><td></td><td>계산기형</td></tr>
+      </tbody>
+    </table>
+    <ul class="note">
+      {% for f in fields %}<li><b>{{ f.name }}</b> — {{ f.desc }}</li>{% endfor %}
+      <li><b>입력</b> — 보도자료 / 기사 (비우면 보도자료)</li>
+      <li>유형은 {{ types|join(', ') }} 중 하나 (띄어쓰기·가운뎃점은 달라도 됨)</li>
+      <li>인터랙티브유형은 판정이 ‘승인’일 때만 나와요 (기사 입력 제외). ‘시뮬레이터’, ‘맵’처럼 Studio 클래스 이름 일부만 써도 알아봐요</li>
+      <li>판정은 기사 작성 에이전트가 내요. 인터랙티브유형 정답이 있는 행만 인터랙티브 기사 에이전트를 돌리고, 그것도 판정이 ‘승인’일 때만 실행돼요 (기사 입력은 판정 없이 바로)</li>
+    </ul>
+  </section>
+
+  {% if runs %}
+  <section class="panel pane">
+    <h2 class="sec-h">최근 실행</h2>
+    <ul class="runs">
+      {% for r in runs.values()|reverse %}
+        <li><a href="{{ url_for('eval_view', run_id=r.id) }}">{{ r.id }}</a> · {{ r.source }} · {{ r.done }}/{{ r.total }}
+          {% if r.status == 'running' %}<span class="badge">실행 중</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+</main>
+{% endblock %}

@@ -10,3 +10,7 @@ venv/
 # OS / 에디터
 .DS_Store
 .vscode/
+
+# 검증 결과·업로드본
+eval/results/
+eval/uploads/

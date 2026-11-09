@@ -14,6 +14,10 @@
     <div class="date" id="today"></div>
     <a class="logo" href="{{ url_for('index') }}">보도자료<span>→</span>기사</a>
     <p class="tagline">보도자료를 넣으면, 지면에 실릴 기사 초안이 나옵니다</p>
+    <nav class="nav" aria-label="메뉴">
+      <a href="{{ url_for('index') }}" class="{{ 'on' if request.endpoint == 'index' }}">기사 작성</a>
+      <a href="{{ url_for('eval_home') }}" class="{{ 'on' if request.endpoint and request.endpoint.startswith('eval') }}">정답지 검증</a>
+    </nav>
     <div class="double-rule"></div>
   </header>
   {% endblock %}

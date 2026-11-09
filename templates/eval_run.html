@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}검증 결과 {{ run.id }} | 보도자료 → 기사{% endblock %}
+{% block content %}
+{% if run.status == 'running' %}<meta http-equiv="refresh" content="3">{% endif %}
+<main class="result">
+  <div class="flow-head">
+    <h1>검증 결과 <span class="muted">{{ run.id }}</span></h1>
+    <p class="note">{{ run.source }} · 시작 {{ run.started }}
+      {% if run.csv %} · <a href="{{ url_for('eval_csv', run_id=run.id) }}">결과 CSV 내려받기</a>{% endif %}
+      · <a href="{{ url_for('eval_home') }}">검증 처음으로</a></p>
+  </div>
+
+  {% if run.status == 'running' %}
+    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="{{ run.total }}" aria-valuenow="{{ run.done }}">
+      <div style="width: {{ (run.done * 100 / run.total) if run.total else 0 }}%"></div>
+    </div>
+    <p class="note">{{ run.done }} / {{ run.total }}개 완료 — 3초마다 자동으로 새로고침돼요.</p>
+  {% elif run.status == 'error' %}
+    <div class="alert">⚠ 검증 중 오류: {{ run.error }}</div>
+  {% endif %}
+
+  {% if run.summary %}
+  <div class="cards">
+    {% for f in fields %}{% set x = run.summary.fields[f.name] %}
+      <section class="card score">
+        <h2 class="card-h">{{ f.desc }}</h2>
+        {% if x.scored %}
+          <span class="big">{{ x.pct }}%</span>
+          <span class="note">정답 {{ x.correct }} / 채점 {{ x.scored }}건</span>
+        {% else %}
+          <span class="big muted">—</span><span class="note">정답지에 {{ f.name }} 정답이 없어요</span>
+        {% endif %}
+      </section>
+    {% endfor %}
+    <section class="card score">
+      <h2 class="card-h">모든 항목 정답</h2>
+      {% if run.summary.all.scored %}
+        <span class="big">{{ run.summary.all.pct }}%</span>
+        <span class="note">{{ run.summary.all.correct }} / {{ run.summary.all.scored }}건{% if run.summary.errors %} · 오류 {{ run.summary.errors }}건{% endif %}</span>
+      {% else %}<span class="big muted">—</span>{% endif %}
+    </section>
+  </div>
+  {% endif %}
+
+  <div class="table-wrap">
+    <table class="grid results">
+      <thead>
+        <tr><th rowspan="2">파일</th><th rowspan="2">입력</th>
+          {% for f in fields %}<th colspan="2">{{ f.name }}</th>{% endfor %}
+          <th rowspan="2">결과</th><th rowspan="2">소요</th><th rowspan="2">흐름</th></tr>
+        <tr>{% for f in fields %}<th>정답</th><th>에이전트</th>{% endfor %}</tr>
+      </thead>
+      <tbody>
+        {% for r in run.rows %}
+          {% set oks = r.fields.values()|map(attribute='ok')|list %}
+          <tr>
+            <td>{{ r.file }}</td><td>{{ r.kind }}</td>
+            {% for f in fields %}{% set x = r.fields[f.name] %}
+              <td>{{ x.expected or '—' }}</td>
+              <td class="{{ 'hit' if x.ok else ('miss' if x.ok is sameas false) }}">
+                {% if x.ok %}✔ {% elif x.ok is sameas false %}✘ {% endif %}{{ x.predicted or '—' }}</td>
+            {% endfor %}
+            <td>{% if r.status != '완료' %}<span class="miss-t">오류</span>
+                {% elif false in oks %}<span class="miss-t">오답</span>
+                {% elif true in oks %}<span class="hit-t">정답</span>
+                {% else %}<span class="muted">채점 안 함</span>{% endif %}
+                {% if r.error %}<div class="err">{{ r.error }}</div>{% endif %}</td>
+            <td>{{ r.seconds }}초</td>
+            <td>{% if r.item_id %}<a href="{{ url_for('flow', article_id=r.item_id) }}">보기</a>{% else %}—{% endif %}</td>
+          </tr>
+        {% endfor %}
+        {% if run.status == 'running' and run.done < run.total %}
+          <tr><td colspan="{{ 5 + fields|length * 2 }}" class="muted">나머지 {{ run.total - run.done }}개 처리 중…</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  {% if run.missing %}<p class="note">정답지에는 있는데 파일이 없음: {{ run.missing|join(', ') }}</p>{% endif %}
+</main>
+{% endblock %}

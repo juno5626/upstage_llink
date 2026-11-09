@@ -1,259 +1,28 @@
 """
 press2article — 보도자료를 넣으면 기사가 나오는 서비스
 
-흐름
-  보도자료(파일/텍스트) → Upstage Files API 업로드
-  → Upstage Studio 에이전트 실행 (Parse → Classify → Extract → Instruct)
-  → 단계별 결과에서 원문·유형·기사를 꺼내 화면에 표시
+흐름 (자세한 로직은 pipeline.py)
+  보도자료 → [기사 작성 에이전트: 기사 + 판정] → 승인이면 → [인터랙티브 기사 에이전트]
+  기사     →                                               [인터랙티브 기사 에이전트]
+  각 단계의 입력·출력은 /flow/<id> 화면에서 그대로 확인할 수 있음.
+
+검증 (evaluate.py)
+  /eval 화면 또는 `python evaluate.py` — 정답지(eval/answers.csv)와 비교해 표로 채점.
 """
-import io
-import json
 import os
-import re
-import time
 import uuid
-import zipfile
-from xml.sax.saxutils import escape
 
-from dotenv import load_dotenv
-from flask import Flask, redirect, render_template, request, url_for
-from openai import OpenAI
+from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 
-load_dotenv()
-
-UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY", "").strip()
-UPSTAGE_AGENT_ID = os.getenv("UPSTAGE_AGENT_ID", "").strip()
-UPSTAGE_CONFIG_ID = os.getenv("UPSTAGE_CONFIG_ID", "").strip()
-UPSTAGE_PROJECT_ID = os.getenv("UPSTAGE_PROJECT_ID", "").strip()
+import evaluate
+import pipeline
+from pipeline import PRESS_TYPES, agent_ready
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 검증용 여러 파일 업로드 고려
 
-# 생성된 기사를 잠시 보관 (해커톤 데모용 메모리 저장소 — 서버를 끄면 사라짐)
+# 생성 결과를 잠시 보관 (해커톤 데모용 메모리 저장소 — 서버를 끄면 사라짐)
 ARTICLES: dict[str, dict] = {}
-
-ALLOWED_EXT = {"pdf", "docx", "pptx", "xlsx", "png", "jpg", "jpeg", "bmp", "tiff", "heic", "txt"}
-
-# Studio 워크플로우의 '보도자료유형분류' 노드와 같은 목록
-PRESS_TYPES = [
-    "사업·제도 시행", "성과·실적 홍보", "행사·일정 안내", "통계·조사 발표",
-    "협약·MOU", "인사·동정", "해명·설명", "안전·재난 안내", "기타",
-]
-
-
-# ──────────────────────────────────────────────
-# 입력 준비
-# ──────────────────────────────────────────────
-def text_to_docx(text: str) -> bytes:
-    """붙여넣은 텍스트를 최소한의 Word(.docx) 파일로 변환 (에이전트는 TXT를 받지 않음)."""
-    paras = "".join(
-        f'<w:p><w:r><w:t xml:space="preserve">{escape(line)}</w:t></w:r></w:p>'
-        for line in text.splitlines()
-    )
-    files = {
-        "[Content_Types].xml": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-            '<Default Extension="xml" ContentType="application/xml"/>'
-            '<Override PartName="/word/document.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-            '</Types>'),
-        "_rels/.rels": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-            'Target="word/document.xml"/></Relationships>'),
-        "word/document.xml": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-            f'<w:body>{paras}</w:body></w:document>'),
-    }
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, content in files.items():
-            z.writestr(name, content)
-    return buf.getvalue()
-
-
-# ──────────────────────────────────────────────
-# Upstage Studio 에이전트 호출
-# ──────────────────────────────────────────────
-def _client() -> OpenAI:
-    headers = {"x-project-id": UPSTAGE_PROJECT_ID} if UPSTAGE_PROJECT_ID else None
-    return OpenAI(api_key=UPSTAGE_API_KEY, base_url="https://api.upstage.ai/v2",
-                  default_headers=headers)
-
-
-def _steps(job) -> list[tuple[str, str]]:
-    """Job 결과의 output을 [(단계 이름, 텍스트), ...]로 정리."""
-    steps = []
-    for item in getattr(job, "output", None) or []:
-        name = getattr(item, "model", None) or ""
-        texts = []
-        for c in getattr(item, "content", None) or []:
-            t = getattr(c, "text", None)
-            if t:
-                texts.append(t)
-        if texts:
-            steps.append((str(name), "\n".join(texts)))
-    return steps
-
-
-def run_agent(filename: str, data: bytes, press_type: str | None = None):
-    """파일 업로드 → 에이전트 Job 실행 → 완료까지 대기. 단계별 결과 목록을 돌려줌.
-    press_type을 주면 '이 유형으로 작성하라'는 텍스트를 함께 보냄 (유형 수정 후 다시 만들기)."""
-    client = _client()
-    uploaded = client.files.create(file=(filename, data), purpose="user_data")
-
-    content = [{"type": "input_file", "file_id": uploaded.id}]
-    if press_type:
-        content.append({
-            "type": "input_text",
-            "text": f"이 보도자료의 유형은 '{press_type}'입니다. 이 유형으로 분류해 그 형식에 맞는 기사를 작성하세요.",
-        })
-    extra = {"config_id": UPSTAGE_CONFIG_ID} if UPSTAGE_CONFIG_ID else None
-
-    include = ["all"]  # 원문(Parse)과 유형(Classify) 결과도 받기 위해 모든 단계 결과 요청
-    job = client.responses.create(model=UPSTAGE_AGENT_ID, include=include,
-                                  input=[{"role": "user", "content": content}], extra_body=extra)
-    for _ in range(150):  # 최대 약 5분 대기
-        if job.status not in ("queued", "in_progress"):
-            break
-        time.sleep(2)
-        job = client.responses.retrieve(job.id, include=include)
-    if job.status != "completed":
-        raise RuntimeError(f"에이전트 실행 실패 (status={job.status}, error={job.error})")
-
-    steps = _steps(job)
-    if not steps:
-        raise RuntimeError("에이전트가 결과를 돌려주지 않았습니다. Studio 워크플로우를 확인하세요.")
-    return steps
-
-
-def _plain(text: str) -> str:
-    """Parse 결과(JSON/HTML/마크다운)를 사람이 읽을 원문 텍스트로."""
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            content = data.get("content", data)
-            if isinstance(content, dict):
-                text = content.get("markdown") or content.get("text") or content.get("html") or text
-            elif isinstance(content, str):
-                text = content
-        elif isinstance(data, str):
-            text = data
-    except (ValueError, json.JSONDecodeError):
-        pass
-    text = re.sub(r"<br\s*/?>", "\n", text)
-    text = re.sub(r"</(p|h\d|li|tr|div)>", "\n", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"^#+\s*", "", text, flags=re.M)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"[\s·/\-_.,]", "", s).lower()
-
-
-def detect_type(steps: list[tuple[str, str]]) -> str | None:
-    """최종 단계를 뺀 단계들에서 보도자료 유형 이름을 찾음 (분류 노드 결과)."""
-    keys = {_norm(t): t for t in PRESS_TYPES}
-    keys[_norm("others")] = "기타"
-    middle = steps[:-1]
-    # 이름에 classify/분류가 들어간 단계를 먼저 확인
-    middle.sort(key=lambda s: 0 if re.search(r"classif|분류", s[0], re.I) else 1)
-    for name, text in middle:
-        try:  # JSON 안의 한글이 \uXXXX로 이스케이프된 경우 풀어서 비교
-            text = json.dumps(json.loads(text), ensure_ascii=False)
-        except (ValueError, json.JSONDecodeError):
-            pass
-        for hay in (_norm(text[:500]), _norm(name)):
-            for k, v in keys.items():
-                if k and k in hay:
-                    return v
-    return None
-
-
-def find_source(steps: list[tuple[str, str]]) -> str:
-    """Parse(문서 인식) 단계의 결과를 원문으로 사용."""
-    for name, text in steps:
-        if re.search(r"parse|인식", name, re.I):
-            return _plain(text)
-    return _plain(steps[0][1]) if len(steps) > 1 else ""
-
-
-# ──────────────────────────────────────────────
-# 기사 결과 정리
-# ──────────────────────────────────────────────
-def _clean(text: str) -> str:
-    text = re.sub(r"【[^】]*】", "", str(text))  # 출처 표시 제거
-    text = text.replace("**", "")
-    return re.sub(r"[ \t]{2,}", " ", text).strip()
-
-
-def to_article(raw) -> dict:
-    """에이전트 최종 출력(JSON 객체, JSON 문자열, 마크다운)을 기사 dict로."""
-    for _ in range(3):  # JSON으로 여러 번 감싸져 온 경우 벗겨내기
-        if not isinstance(raw, str):
-            break
-        s = raw.strip()
-        if s.startswith("```"):
-            s = s.strip("`").removeprefix("json").strip()
-        try:
-            raw = json.loads(s)
-        except (ValueError, json.JSONDecodeError):
-            raw = s
-            break
-
-    if isinstance(raw, dict):
-        if "headline" in raw or "body" in raw:
-            body = raw.get("body", [])
-            if isinstance(body, str):
-                body = body.split("\n")
-            titles = (raw.get("headlines") or raw.get("titles")
-                      or raw.get("headline_candidates") or [])
-            if isinstance(titles, str):
-                titles = [titles]
-            return {
-                "headline": _clean(raw.get("headline", "")),
-                "titles": [_clean(t) for t in titles if str(t).strip()],
-                "lead": _clean(raw.get("lead", "")),
-                "body": [_clean(p) for p in body if str(p).strip()],
-            }
-        texts = [v for v in raw.values() if isinstance(v, str)]
-        raw = max(texts, key=len) if texts else json.dumps(raw, ensure_ascii=False)
-
-    text = str(raw).replace("\\n", "\n")
-    headline, body, titles = "", [], []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line == "---":
-            continue
-        m = re.match(r"^(?:제목\s*후보|후보|제목)\s*\d*\s*[:：.)]\s*(.+)$", line)
-        if m:
-            titles.append(_clean(m.group(1)))
-            continue
-        if line.startswith("# ") and not headline:
-            headline = _clean(line[2:])
-        else:
-            cleaned = _clean(line.lstrip("#").lstrip("-").strip())
-            if cleaned:
-                body.append(cleaned)
-    if not headline and body:
-        headline = body.pop(0)
-    return {"headline": headline or "생성된 기사", "titles": titles,
-            "lead": body.pop(0) if len(body) > 1 else "", "body": body}
-
-
-def title_candidates(article: dict) -> list[str]:
-    """제목 후보 최대 3개 (에이전트가 후보를 주지 않으면 제목 1개)."""
-    out = []
-    for t in [article.get("headline", "")] + article.get("titles", []):
-        if t and t not in out:
-            out.append(t)
-    return out[:3]
 
 
 # ──────────────────────────────────────────────
@@ -327,65 +96,59 @@ def compare(source: str, paragraphs: list[str]) -> dict:
 
 
 # ──────────────────────────────────────────────
-# 라우트
+# 라우트 — 기사 작성 / 흐름 보기
 # ──────────────────────────────────────────────
-def _build(item: dict, steps: list[tuple[str, str]], forced_type: str | None = None):
-    article = to_article(steps[-1][1])
-    if not item.get("source_fixed"):
-        item["source"] = find_source(steps) or item.get("source", "")
-    item["article"] = article
-    item["titles"] = title_candidates(article)
-    item["detected"] = detect_type(steps) or "기타"
-    item["type"] = forced_type or item["detected"]
-    paras = ([article["lead"]] if article["lead"] else []) + article["body"]
-    item["cmp"] = compare(item["source"], paras)
-    item["has_lead"] = bool(article["lead"])
+def _finish(item: dict, outlet: str = "") -> str:
+    """처리된 item에 화면용 비교 결과를 붙여 저장하고 id를 돌려줌."""
+    item["outlet"] = outlet
+    if item.get("article"):
+        a = item["article"]
+        item["cmp"] = compare(item["source"], ([a["lead"]] if a["lead"] else []) + a["body"])
+    item_id = uuid.uuid4().hex[:10]
+    ARTICLES[item_id] = item
+    return item_id
+
+
+def store(item: dict) -> str:  # 검증 화면에서도 결과를 흐름 화면으로 열 수 있게
+    return _finish(item)
+
+
+def _status():
+    return {"ready": agent_ready("writer"), "ready2": agent_ready("interactive")}
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html", ready=bool(UPSTAGE_API_KEY and UPSTAGE_AGENT_ID))
+    return render_template("index.html", **_status())
 
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    if not (UPSTAGE_API_KEY and UPSTAGE_AGENT_ID):
-        return render_template("index.html", ready=False,
-                               error="UPSTAGE_API_KEY와 UPSTAGE_AGENT_ID를 .env에 넣어주세요.")
+    kind = "article" if request.form.get("kind") == "article" else "press"
+    need = "interactive" if kind == "article" else "writer"
+    if not agent_ready(need):
+        return render_template("index.html", **_status(),
+                               error=f"{pipeline.AGENTS[need]['label']} 설정이 .env에 없습니다.")
 
-    outlet = request.form.get("outlet", "").strip()
     pasted = request.form.get("press_text", "").strip()
     upload = request.files.get("press_file")
-
     try:
-        item = {"outlet": outlet or "", "source": "", "source_fixed": False}
         if upload and upload.filename:
-            ext = upload.filename.rsplit(".", 1)[-1].lower()
-            if ext in ("hwp", "hwpx"):
-                raise ValueError("HWP 파일은 에이전트가 읽지 못해요. 한글에서 'PDF로 저장'한 뒤 올려주세요.")
-            if ext not in ALLOWED_EXT:
-                raise ValueError(f"지원하지 않는 파일 형식입니다: .{ext}")
-            data = upload.read()
-            if ext == "txt":
-                text = data.decode("utf-8", errors="ignore")
-                item.update(filename=upload.filename, file=("press_release.docx", text_to_docx(text)),
-                            source=text, source_fixed=True)
-            else:
-                item.update(filename=upload.filename, file=(upload.filename, data))
+            item = pipeline.process(upload.filename, upload.read(), kind=kind,
+                                    with_interactive=agent_ready("interactive"))
         elif pasted:
-            item.update(filename=None, file=("press_release.docx", text_to_docx(pasted)),
-                        source=pasted, source_fixed=True)
+            item = pipeline.process("pasted.txt", pasted.encode("utf-8"), kind=kind,
+                                    with_interactive=agent_ready("interactive"),
+                                    display_name="붙여넣은 텍스트")
         else:
-            raise ValueError("보도자료 파일을 첨부하거나 내용을 붙여넣어 주세요.")
-
-        steps = run_agent(*item["file"])
-        _build(item, steps)
+            raise ValueError("파일을 첨부하거나 내용을 붙여넣어 주세요.")
     except Exception as e:  # 데모용: 오류를 화면에 그대로 보여줌
-        return render_template("index.html", ready=True, error=str(e))
+        return render_template("index.html", **_status(), error=str(e))
 
-    article_id = uuid.uuid4().hex[:10]
-    ARTICLES[article_id] = item
-    return redirect(url_for("article", article_id=article_id))
+    item_id = _finish(item, request.form.get("outlet", "").strip())
+    if item.get("article"):
+        return redirect(url_for("article", article_id=item_id))
+    return redirect(url_for("flow", article_id=item_id))
 
 
 @app.route("/article/<article_id>")
@@ -393,8 +156,18 @@ def article(article_id):
     item = ARTICLES.get(article_id)
     if not item:
         return redirect(url_for("index"))
+    if not item.get("article"):
+        return redirect(url_for("flow", article_id=article_id))
     return render_template("article.html", id=article_id, types=PRESS_TYPES,
                            error=request.args.get("error"), **item)
+
+
+@app.route("/flow/<article_id>")
+def flow(article_id):
+    item = ARTICLES.get(article_id)
+    if not item:
+        return redirect(url_for("index"))
+    return render_template("flow.html", id=article_id, item=item, kind_label=pipeline.KIND_LABEL)
 
 
 @app.route("/article/<article_id>/regenerate", methods=["POST"])
@@ -406,13 +179,71 @@ def regenerate(article_id):
     if new_type not in PRESS_TYPES:
         return redirect(url_for("article", article_id=article_id))
     try:
-        steps = run_agent(*item["file"], press_type=new_type)
-        _build(item, steps, forced_type=new_type)
+        new = pipeline.process(*item["orig"], kind=item["kind"], press_type=new_type,
+                               with_interactive=agent_ready("interactive"),
+                               display_name=item["filename"])
     except Exception as e:
         return redirect(url_for("article", article_id=article_id,
                                 error=f"다시 만들기에 실패했어요: {e}"))
+    outlet = item.get("outlet", "")
+    ARTICLES[article_id] = new
+    new["outlet"] = outlet
+    a = new["article"]
+    new["cmp"] = compare(new["source"], ([a["lead"]] if a["lead"] else []) + a["body"])
     return redirect(url_for("article", article_id=article_id))
 
 
+# ──────────────────────────────────────────────
+# 라우트 — 검증(정답지 채점)
+# ──────────────────────────────────────────────
+@app.route("/eval", methods=["GET"])
+def eval_home():
+    answers = evaluate.read_answers()
+    inputs = []
+    for rel, _ in evaluate.list_inputs():
+        row = evaluate._match(answers, rel)
+        inputs.append({"file": rel, "row": row,
+                       "kind": pipeline.KIND_LABEL[evaluate._kind(rel, row)]})
+    rel = lambda p: os.path.relpath(p, evaluate.BASE).replace("\\", "/")
+    return render_template("eval.html", runs=evaluate.RUNS, inputs=inputs, types=PRESS_TYPES,
+                           answers_rel=rel(evaluate.ANSWERS), inputs_rel=rel(evaluate.INPUTS) + "/",
+                           fields=evaluate.FIELDS, error=request.args.get("error"), **_status())
+
+
+@app.route("/eval/run", methods=["POST"])
+def eval_run():
+    files = [f for f in request.files.getlist("files") if f.filename]
+    answers = request.files.get("answers")
+    try:
+        if files:  # 업로드한 파일로 실행 (업로드본은 eval/uploads/<id>/ 에 보관)
+            run_id = evaluate.start_upload_run(
+                [(f.filename, f.read()) for f in files],
+                answers.read() if answers and answers.filename else None, store=store)
+        else:      # eval/inputs 폴더로 실행
+            run_id = evaluate.start_run(store=store)
+    except Exception as e:
+        return redirect(url_for("eval_home", error=str(e)))
+    return redirect(url_for("eval_view", run_id=run_id))
+
+
+@app.route("/eval/<run_id>")
+def eval_view(run_id):
+    run = evaluate.RUNS.get(run_id)
+    if not run:
+        return redirect(url_for("eval_home"))
+    return render_template("eval_run.html", run=run, fields=evaluate.FIELDS)
+
+
+@app.route("/eval/<run_id>/csv")
+def eval_csv(run_id):
+    run = evaluate.RUNS.get(run_id)
+    if not run or not run.get("csv"):
+        abort(404)
+    return send_file(run["csv"], as_attachment=True, download_name=os.path.basename(run["csv"]))
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.getenv("PORT", 5001)))
+    # 0.0.0.0 → 같은 와이파이의 다른 기기에서도 접속 가능 (HOST=127.0.0.1 이면 이 컴퓨터에서만)
+    # 디버그 모드는 네트워크에 열면 위험해서 기본은 끔. 코드 수정 시 자동 재시작이 필요하면 DEBUG=1
+    app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", 5001)),
+            debug=os.getenv("DEBUG") == "1")

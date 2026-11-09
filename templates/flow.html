@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}처리 흐름 · {{ item.filename or '입력' }} | 보도자료 → 기사{% endblock %}
+
+{% block header %}
+<header class="topbar">
+  <div class="topbar-row">
+    <a class="back" href="{{ url_for('index') }}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+      새 입력
+    </a>
+    <a class="logo small" href="{{ url_for('index') }}">보도자료<span>→</span>기사</a>
+    <div class="actions">
+      {% if item.article %}<a class="btn-dark" href="{{ url_for('article', article_id=id) }}">완성된 기사 보기</a>{% endif %}
+    </div>
+  </div>
+  <div class="double-rule"></div>
+</header>
+{% endblock %}
+
+{% block content %}
+<main class="result flow">
+  <div class="flow-head">
+    <h1>처리 흐름</h1>
+    <p class="note">{{ kind_label[item.kind] }} <b>{{ item.filename }}</b> 이(가) 어떤 단계를 거쳐 무엇이 나왔는지 순서대로 보여줘요. 각 단계의 <b>보낸 것 / 받은 것</b>은 에이전트와 주고받은 원본 그대로입니다.</p>
+  </div>
+
+  <ol class="pipe" aria-label="단계 요약">
+    {% for s in item.trace %}
+      <li class="{{ 'bad' if s.error }}">
+        <a href="#stage-{{ loop.index }}">
+          <span class="num">{{ loop.index }}</span>
+          <span>{{ s.label.split(' (')[0] }}</span>
+          {% if s.kind == 'agent' %}<small>{{ '실패' if s.error else s.seconds ~ '초' }}</small>{% endif %}
+        </a>
+      </li>
+    {% endfor %}
+  </ol>
+
+  {% for s in item.trace %}
+  <section class="stage {{ s.kind }} {{ 'bad' if s.error }}" id="stage-{{ loop.index }}">
+    {% if s.kind == 'agent' %}<span id="stage-{{ s.key }}"></span>{% endif %}
+    {% if s.kind == 'gate' %}<span id="stage-gate"></span>{% endif %}
+    <h2><span class="num">{{ loop.index }}</span>{{ s.label }}</h2>
+
+    {% if s.kind in ('input', 'parse', 'gate') %}
+      <table class="kv">
+        {% for k, v in s.rows %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}
+      </table>
+      {% if s.preview %}
+        <details class="raw"><summary>입력 내용 보기 ({{ '{:,}'.format(s.preview|length) }}자)</summary><pre>{{ s.preview }}</pre></details>
+      {% endif %}
+      {% if s.kind == 'parse' and item.article %}
+        <p class="note"><a href="{{ url_for('article', article_id=id) }}">→ 이 결과로 만든 기사 화면</a></p>
+      {% endif %}
+
+    {% else %}
+      <table class="kv">
+        <tr><th>Agent ID</th><td><code>{{ s.agent_id or '-' }}</code></td></tr>
+        <tr><th>Config</th><td><code>{{ s.config_id }}</code></td></tr>
+        <tr><th>상태</th><td>{% if s.error %}<b class="bad-t">실패</b> · {{ s.error }}{% else %}<b>{{ s.status }}</b> · {{ s.seconds }}초{% endif %}</td></tr>
+        <tr><th>Job ID</th><td><code>{{ s.job_id or '-' }}</code></td></tr>
+      </table>
+
+      <div class="io">
+        <div class="io-col">
+          <h3>보낸 것</h3>
+          <ul class="sent">
+            <li>📄 파일 <b>{{ s.input_file }}</b> ({{ s.input_size }}) → Files API 업로드{% if s.file_id %} · <code>{{ s.file_id }}</code>{% endif %}</li>
+            {% if s.input_text %}<li>💬 함께 보낸 지시: “{{ s.input_text }}”</li>{% endif %}
+          </ul>
+          {% if s.input_preview %}
+            <details class="raw"><summary>보낸 파일 내용 ({{ '{:,}'.format(s.input_preview|length) }}자)</summary><pre>{{ s.input_preview }}</pre></details>
+          {% endif %}
+        </div>
+        <div class="io-col">
+          <h3>받은 것 · 워크플로우 노드 {{ s.steps|length }}개</h3>
+          {% for st in s.steps %}
+            <details class="raw" {% if loop.last %}open{% endif %}>
+              <summary><span class="node">{{ loop.index }}. {{ st.name or '(이름 없음)' }}</span>
+                <small>{{ '{:,}'.format(st.text|length) }}자{% if loop.last %} · 최종 출력{% endif %}</small></summary>
+              <pre>{{ st.text }}</pre>
+            </details>
+          {% else %}
+            <p class="note">받은 결과가 없어요.</p>
+          {% endfor %}
+        </div>
+      </div>
+
+      {% if s.key == 'interactive' and item.interactive and not item.interactive.error %}
+        <div class="verdict">
+          <span class="card-h">결과</span>
+          <span class="type-name accent">{{ item.interactive.itype or '유형을 읽지 못함' }}</span>
+        </div>
+        {% if item.interactive.html %}
+          <h3>생성된 웹페이지 미리보기</h3>
+          <iframe class="preview" sandbox="allow-scripts" srcdoc="{{ item.interactive.html }}" title="에이전트가 만든 웹페이지"></iframe>
+        {% endif %}
+      {% endif %}
+    {% endif %}
+  </section>
+  {% endfor %}
+</main>
+{% endblock %}
